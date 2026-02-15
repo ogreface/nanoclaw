@@ -730,11 +730,11 @@ Read `container/agent-runner/src/ipc-mcp-stdio.ts` and add permission management
 ```typescript
 server.tool(
   'workspace_grant_permission',
-  'Grant a Google Workspace permission to a group. Main/owner only. Available services: gmail, calendar, drive. Available permissions: read_email, send_email, read_calendar, create_event, read_files, write_files.',
+  'Grant a Google Workspace permission to a group. Main/owner only. Available services: gmail, calendar, drive, docs, sheets. Available permissions: read_email, send_email, read_calendar, create_event, read_files, write_files, read_docs, create_docs, read_sheets, create_sheets, update_sheets.',
   {
     group_folder: z.string().describe('Group folder name (e.g., "family-chat")'),
-    service: z.enum(['gmail', 'calendar', 'drive']).describe('Service to grant access to'),
-    permission: z.string().describe('Permission to grant (e.g., "read_email", "send_email")'),
+    service: z.enum(['gmail', 'calendar', 'drive', 'docs', 'sheets']).describe('Service to grant access to'),
+    permission: z.string().describe('Permission to grant (e.g., "read_email", "send_email", "read_docs", "read_sheets")'),
   },
   async (args) => {
     if (!isMain) {
@@ -766,7 +766,7 @@ server.tool(
   'Revoke a Google Workspace permission from a group. Main/owner only.',
   {
     group_folder: z.string().describe('Group folder name'),
-    service: z.enum(['gmail', 'calendar', 'drive']).describe('Service'),
+    service: z.enum(['gmail', 'calendar', 'drive', 'docs', 'sheets']).describe('Service'),
     permission: z.string().describe('Permission to revoke'),
   },
   async (args) => {
@@ -840,6 +840,63 @@ server.tool(
     }
   }
 );
+
+server.tool(
+  'workspace_apply_template',
+  'Apply a permission template to a group. Main/owner only. Available templates: personal-full, family-readonly, work-readonly, calendar-only, email-only, docs-editor.',
+  {
+    group_folder: z.string().describe('Group folder name to apply template to'),
+    template: z.enum(['personal-full', 'family-readonly', 'work-readonly', 'calendar-only', 'email-only', 'docs-editor']).describe('Template name'),
+    replace: z.boolean().optional().describe('If true, remove existing permissions before applying template (default: false)'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text', text: 'Permission denied: Only main/owner can apply templates' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'apply_template',
+      groupFolder: args.group_folder,
+      template: args.template,
+      replace: args.replace || false,
+      grantedBy: groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text', text: `Template "${args.template}" ${args.replace ? 'applied (replaced existing)' : 'applied'} to ${args.group_folder}` }]
+    };
+  },
+);
+
+server.tool(
+  'workspace_list_templates',
+  'List available permission templates with descriptions.',
+  {},
+  async () => {
+    const templates = {
+      'personal-full': 'Full access to all Google Workspace services (personal use)',
+      'family-readonly': 'Read-only access for family members (calendar, drive, docs, sheets)',
+      'work-readonly': 'Read-only access to work-related services (email, calendar, drive, docs, sheets)',
+      'calendar-only': 'Calendar access only',
+      'email-only': 'Email read access only',
+      'docs-editor': 'Read and edit Docs/Sheets (includes drive read)',
+    };
+
+    const formatted = Object.entries(templates)
+      .map(([name, desc]) => `*${name}*\n  ${desc}`)
+      .join('\n\n');
+
+    return {
+      content: [{ type: 'text', text: `Available templates:\n\n${formatted}` }]
+    };
+  },
+);
 ```
 
 ### Step 8: Add Permission IPC Handlers
@@ -880,6 +937,35 @@ case 'revoke_permission': {
   logger.info({ groupFolder, service, permission }, 'Permission revoked');
   break;
 }
+
+case 'apply_template': {
+  const groupFolder = (data as any).groupFolder;
+  const template = (data as any).template;
+  const replace = (data as any).replace;
+  const grantedBy = (data as any).grantedBy;
+
+  if (groupFolder && template && WORKSPACE_PERMISSION_TEMPLATES[template]) {
+    const templatePerms = WORKSPACE_PERMISSION_TEMPLATES[template].permissions;
+    applyPermissionTemplate(groupFolder, templatePerms, grantedBy, replace);
+
+    // Update permissions file
+    const permissionsFile = path.join(DATA_DIR, 'permissions.json');
+    const allPerms = getAllWorkspacePermissions();
+    fs.writeFileSync(permissionsFile, JSON.stringify(allPerms, null, 2));
+
+    logger.info({ groupFolder, template, replace }, 'Permission template applied');
+  } else {
+    logger.warn({ data }, 'Invalid apply_template request - missing required fields or unknown template');
+  }
+  break;
+}
+```
+
+Also update the imports at the top of the file to include:
+
+```typescript
+import { WORKSPACE_PERMISSION_TEMPLATES } from './config.js';
+import { applyPermissionTemplate } from './db.js';
 ```
 
 ### Step 9: Copy Workspace MCP into Container
@@ -904,6 +990,7 @@ You have access to Google Workspace via permission-controlled tools:
 
 ### Gmail
 - `mcp__workspace__gmail_search` - Search emails (requires gmail.read_email)
+- `mcp__workspace__gmail_get` - Get full email content by ID (requires gmail.read_email)
 - `mcp__workspace__gmail_send` - Send email (requires gmail.send_email, owner only)
 
 ### Calendar
@@ -914,12 +1001,25 @@ You have access to Google Workspace via permission-controlled tools:
 - `mcp__workspace__drive_list_files` - List files (requires drive.read_files)
 - `mcp__workspace__drive_read_file` - Read file content (requires drive.read_files)
 
+### Docs
+- `mcp__workspace__docs_read` - Read Google Doc content (requires docs.read_docs)
+- `mcp__workspace__docs_create` - Create new Google Doc (requires docs.create_docs, owner only)
+
+### Sheets
+- `mcp__workspace__sheets_read` - Read Google Sheets data (requires sheets.read_sheets)
+- `mcp__workspace__sheets_create` - Create new spreadsheet (requires sheets.create_sheets, owner only)
+- `mcp__workspace__sheets_update` - Update spreadsheet data (requires sheets.update_sheets, owner only)
+
 ### Permission Management (Main/Owner Only)
 - `mcp__nanoclaw__workspace_grant_permission` - Grant permission to a group
 - `mcp__nanoclaw__workspace_revoke_permission` - Revoke permission from a group
 - `mcp__nanoclaw__workspace_list_permissions` - List current permissions
+- `mcp__nanoclaw__workspace_apply_template` - Apply permission template (e.g., "family-readonly", "work-readonly")
+- `mcp__nanoclaw__workspace_list_templates` - List available templates
 
-**Note:** Write operations (send email, create event) are restricted to the owner regardless of permissions.
+**Permission Templates:** Use `workspace_apply_template` to quickly set up common permission sets like "personal-full", "family-readonly", "work-readonly", "calendar-only", "email-only", or "docs-editor".
+
+**Note:** Write operations (send email, create event, create/update docs/sheets) are restricted to the owner regardless of permissions.
 ```
 
 Also update `groups/main/CLAUDE.md` with the same content.
@@ -1034,6 +1134,8 @@ tail -f logs/nanoclaw.log
 - `gmail` - Gmail access
 - `calendar` - Google Calendar access
 - `drive` - Google Drive access
+- `docs` - Google Docs access
+- `sheets` - Google Sheets access
 
 ### Available Permissions
 
@@ -1050,6 +1152,69 @@ tail -f logs/nanoclaw.log
 #### Drive
 - `read_files` - List and read files
 - `write_files` - Upload and modify files (owner only)
+
+#### Docs
+- `read_docs` - Read Google Docs content
+- `create_docs` - Create new Google Docs (owner only)
+
+#### Sheets
+- `read_sheets` - Read Google Sheets data
+- `create_sheets` - Create new spreadsheets (owner only)
+- `update_sheets` - Update spreadsheet data (owner only)
+
+---
+
+## Permission Templates
+
+Instead of granting individual permissions, you can use predefined templates:
+
+### Available Templates
+
+**personal-full**
+- Full access to all Google Workspace services
+- Includes read and write for all services
+- Best for: Personal use with full control
+
+**family-readonly**
+- Read-only access for family members
+- Calendar, Drive, Docs, Sheets (read-only)
+- Best for: Family sharing without modification rights
+
+**work-readonly**
+- Read-only access to work services
+- Email, Calendar, Drive, Docs, Sheets (read-only)
+- Best for: Work groups with view-only access
+
+**calendar-only**
+- Calendar read access only
+- Best for: Simple calendar sharing
+
+**email-only**
+- Email read access only
+- Best for: Email monitoring groups
+
+**docs-editor**
+- Read and edit Docs/Sheets
+- Includes Drive read access
+- Best for: Document collaboration groups
+
+### Apply a Template
+
+```
+@Andy workspace_apply_template group_folder:"family-chat" template:"family-readonly"
+```
+
+### Replace Existing Permissions with Template
+
+```
+@Andy workspace_apply_template group_folder:"work-team" template:"work-readonly" replace:true
+```
+
+### List Available Templates
+
+```
+@Andy workspace_list_templates
+```
 
 ---
 
